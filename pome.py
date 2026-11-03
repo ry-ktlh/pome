@@ -25,7 +25,7 @@ import sys
 import time
 import unicodedata
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or
                           os.path.expanduser("~/.config"), "pome")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
@@ -297,12 +297,27 @@ class Editor:
             pass
 
     def save_config(self):
+        """設定ファイルは一時ファイル経由で置き換え、書込中断による破損を減らす。"""
+        temporary = None
         try:
             os.makedirs(CONFIG_DIR, exist_ok=True)
-            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            fd, temporary = tempfile.mkstemp(prefix=".pome-config-", dir=CONFIG_DIR)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(self.config, f, ensure_ascii=False, indent=2)
-        except Exception:
+                f.write("\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temporary, CONFIG_PATH)
+            temporary = None
+        except OSError:
+            # 設定の保存失敗で本文の保存結果を失敗扱いにしない。
             pass
+        finally:
+            if temporary is not None:
+                try:
+                    os.unlink(temporary)
+                except FileNotFoundError:
+                    pass
 
     # ------------------------------------------------------------ 入出力
 
@@ -473,16 +488,26 @@ class Editor:
             self.msgbox("履歴の読み込みエラー", [str(e)])
 
     def emergency_save(self):
-        """異常終了時の退避保存"""
+        """異常終了時の未保存データを、上書きしない固有のファイルへ退避。"""
         if not self.dirty:
             return None
         base = self.path or os.path.expanduser("~/無題.txt")
-        rescue = base + ".rescue"
+        rescue = None
         try:
-            with open(rescue, "w", encoding="utf-8") as f:
+            fd, rescue = tempfile.mkstemp(
+                prefix=os.path.basename(base) + ".rescue-",
+                suffix=".txt", dir=os.path.dirname(base))
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write("\n".join(self.lines))
+                f.flush()
+                os.fsync(f.fileno())
             return rescue
         except OSError:
+            if rescue:
+                try:
+                    os.unlink(rescue)
+                except OSError:
+                    pass
             return None
 
     # ------------------------------------------------------------ 折返し
@@ -1562,6 +1587,7 @@ class Editor:
         return out
 
     def act_git_push(self):
+        """現在の原稿のみコミットし、各操作の失敗時には送信を止める。"""
         if self.path is None or self.dirty:
             if not self.save_file():
                 return
@@ -1572,23 +1598,57 @@ class Editor:
             return
         self.flash_now("Git 送信中...（テザリング接続を確認してください）")
         out = []
+        ok = False
         try:
-            p = self.git_run(repo, ["add", self.path])
-            out += self.cp_lines("git add", p)
-            msg = "pome: update %s (%s)" % (
-                os.path.basename(self.path),
-                datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))
-            p = self.git_run(repo, ["commit", "-m", msg])
-            out += self.cp_lines("git commit", p)
+            # 既にステージされた別作業を巻き込まない。
+            staged = self.git_run(repo, ["diff", "--cached", "--name-only", "-z"])
+            if staged.returncode != 0:
+                out.extend(self.cp_lines("git diff --cached", staged))
+                raise RuntimeError("ステージ済みファイルの確認に失敗しました。")
+            if staged.stdout:
+                raise RuntimeError(
+                    "既にステージされた変更があります。誤った一括コミットを防ぐため中止しました。"
+                    "ターミナルで git status を確認してください。")
+
+            p = self.git_run(repo, ["add", "--", self.path])
+            out.extend(self.cp_lines("git add（現在の原稿のみ）", p))
+            if p.returncode != 0:
+                raise RuntimeError("git addに失敗したため、コミット・送信はしません。")
+
+            staged = self.git_run(repo, ["diff", "--cached", "--name-only", "-z"])
+            if staged.returncode != 0:
+                out.extend(self.cp_lines("git diff --cached", staged))
+                raise RuntimeError("コミット対象の確認に失敗しました。")
+            paths = [p for p in staged.stdout.split("\0") if p]
+            expected = os.path.relpath(self.path, repo)
+            if paths not in ([], [expected]):
+                raise RuntimeError(
+                    "コミット対象に別ファイルが含まれています。操作を中止しました。"
+                    "ターミナルで git status を確認してください。")
+
+            if paths:
+                msg = "pome: update %s (%s)" % (
+                    os.path.basename(self.path),
+                    datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))
+                # --only は並行して別ファイルがステージされても巻き込まない。
+                p = self.git_run(
+                    repo, ["commit", "--only", "-m", msg, "--", self.path])
+                out.extend(self.cp_lines("git commit（現在の原稿のみ）", p))
+                if p.returncode != 0:
+                    raise RuntimeError("git commitに失敗しました。pushは実行しません。")
+            else:
+                out.append("現在の原稿にコミットすべき変更はありません。")
+
             p = self.git_run(repo, ["push"])
-            out += self.cp_lines("git push", p)
-            ok = (p.returncode == 0)
+            out.extend(self.cp_lines("git push", p))
+            if p.returncode != 0:
+                raise RuntimeError(
+                    "git pushに失敗しました。作成済みのローカルコミットは保持されています。")
+            ok = True
         except subprocess.TimeoutExpired:
             out.append("時間切れです。接続を確認してください。")
-            ok = False
-        except OSError as e:
+        except (OSError, RuntimeError) as e:
             out.append(str(e))
-            ok = False
         self.flash = None
         self.msgbox("Git プッシュ " + ("完了" if ok else "失敗"), out)
 
@@ -1604,19 +1664,57 @@ class Editor:
             return
         self.flash_now("Git 受信中...（テザリング接続を確認してください）")
         out = []
+        ok = False
         try:
+            # 別プロセスによる原稿変更を読み落としたまま受信しない。
+            if self.path and self._disk_data is not None:
+                try:
+                    with open(self.path, "rb") as f:
+                        current = f.read()
+                except FileNotFoundError:
+                    current = None
+                if current != self._disk_data:
+                    raise RuntimeError(
+                        "原稿が外部で変更または削除されています。再読込を確認してから受信してください。")
+
+            status = self.git_run(
+                repo, ["status", "--porcelain", "--untracked-files=no"])
+            if status.returncode != 0:
+                out.extend(self.cp_lines("git status", status))
+                raise RuntimeError("作業状態を確認できないため受信を中止しました。")
+            if status.stdout.strip():
+                raise RuntimeError(
+                    "未コミットの変更があります。送信・コミットまたは退避してから受信してください。")
+
             p = self.git_run(repo, ["pull", "--ff-only"])
-            out += self.cp_lines("git pull --ff-only", p)
-            ok = (p.returncode == 0)
+            out.extend(self.cp_lines("git pull --ff-only", p))
+            if p.returncode != 0:
+                raise RuntimeError(
+                    "受信に失敗しました。競合を自動解消せず、原稿は上書きしません。")
+            ok = True
+
+            if self.path:
+                try:
+                    with open(self.path, "rb") as f:
+                        current = f.read()
+                except FileNotFoundError:
+                    out.append("受信後、開いていた原稿が見つかりません。"
+                               "現在の表示内容は保持しました。")
+                else:
+                    if current != self._disk_data:
+                        old_y, old_x = self.cy, self.cx
+                        self.load_file(self.path)
+                        self.cy = min(old_y, len(self.lines) - 1)
+                        self.cx = min(old_x, len(self.lines[self.cy]))
+                        out.append("更新された原稿を読み直しました。")
+                    else:
+                        out.append("現在の原稿は変更されていません。編集位置を保持しました。")
         except subprocess.TimeoutExpired:
             out.append("時間切れです。接続を確認してください。")
-            ok = False
-        except OSError as e:
+        except (OSError, RuntimeError) as e:
             out.append(str(e))
             ok = False
         self.flash = None
-        if ok and self.path and os.path.exists(self.path):
-            self.load_file(self.path)
         self.msgbox("Git プル " + ("完了" if ok else "失敗"), out)
 
     def act_git_status(self):
