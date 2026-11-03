@@ -55,7 +55,7 @@ class GitSafetyTests(unittest.TestCase):
         before = self.git("rev-parse", "HEAD").stdout.strip()
         self.editor.act_git_push()
         self.assertEqual(self.git("rev-parse", "HEAD").stdout.strip(), before)
-        self.assertEqual(self.git("diff", "--cached", "--name-only").stdout.strip(), "資料.md")
+        self.assertEqual(self.git("diff", "--cached", "--name-only", "-z").stdout.strip("\0"), "資料.md")
         self.assertIn("失敗", self.messages[-1][0])
 
     def test_commit_contains_only_manuscript_and_push_failure_is_reported(self):
@@ -66,8 +66,8 @@ class GitSafetyTests(unittest.TestCase):
         self.editor.dirty = True
         self.other.write_text("ステージしていない資料の変更", encoding="utf-8")
         self.editor.act_git_push()
-        changed = self.git("diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD")
-        self.assertEqual(changed.stdout.splitlines(), ["原稿.md"])
+        changed = self.git("diff-tree", "--no-commit-id", "--name-only", "-z", "-r", "HEAD")
+        self.assertEqual([p for p in changed.stdout.split("\0") if p], ["原稿.md"])
         self.assertIn("失敗", self.messages[-1][0])  # no remote configured
         self.assertEqual(self.path.read_text(encoding="utf-8"), "更新した原稿")
         self.assertEqual(self.other.read_text(encoding="utf-8"), "ステージしていない資料の変更")
