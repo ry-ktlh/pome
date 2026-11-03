@@ -25,7 +25,7 @@ import sys
 import time
 import unicodedata
 
-VERSION = "1.1.1"
+VERSION = "1.1.2"
 CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or
                           os.path.expanduser("~/.config"), "pome")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
@@ -494,8 +494,12 @@ class Editor:
         base = self.path or os.path.expanduser("~/無題.txt")
         rescue = None
         try:
+            # Filename component has a byte limit (often 255 on ext4).
+            # Hash the original path instead of embedding a potentially
+            # very long UTF-8 manuscript filename in the rescue basename.
+            identifier = hashlib.sha256(os.fsencode(base)).hexdigest()[:12]
             fd, rescue = tempfile.mkstemp(
-                prefix=os.path.basename(base) + ".rescue-",
+                prefix=".pome-rescue-" + identifier + "-",
                 suffix=".txt", dir=os.path.dirname(base))
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write("\n".join(self.lines))
@@ -1586,8 +1590,19 @@ class Editor:
                 out.append("  " + l)
         return out
 
+    def manuscript_matches_disk(self):
+        """Compare the exact saved snapshot to on-disk bytes (including deletion)."""
+        if not self.path:
+            return True
+        try:
+            with open(self.path, "rb") as f:
+                on_disk = f.read()
+        except FileNotFoundError:
+            on_disk = None
+        return on_disk == self._disk_data
+
     def act_git_push(self):
-        """現在の原稿のみコミットし、各操作の失敗時には送信を止める。"""
+        """Commit only the current manuscript; reject stale files and foreign staging."""
         if self.path is None or self.dirty:
             if not self.save_file():
                 return
@@ -1600,15 +1615,35 @@ class Editor:
         out = []
         ok = False
         try:
-            # 既にステージされた別作業を巻き込まない。
+            # Even a clean pome buffer may be stale if another app replaced
+            # the manuscript. Do not silently commit what is not on screen.
+            if not self.manuscript_matches_disk():
+                raise RuntimeError(
+                    "原稿が外部で変更または削除されています。画面とディスクの内容が一致しないため"
+                    "送信を中止しました。別名保存または再読込してから送信してください。")
+
+            expected = os.path.relpath(self.path, repo)
             staged = self.git_run(repo, ["diff", "--cached", "--name-only", "-z"])
             if staged.returncode != 0:
                 out.extend(self.cp_lines("git diff --cached", staged))
                 raise RuntimeError("ステージ済みファイルの確認に失敗しました。")
-            if staged.stdout:
+            paths = [p for p in staged.stdout.split("\0") if p]
+            if paths not in ([], [expected]):
                 raise RuntimeError(
-                    "既にステージされた変更があります。誤った一括コミットを防ぐため中止しました。"
+                    "別のファイルがステージされています。誤コミット防止のため送信を中止しました。"
                     "ターミナルで git status を確認してください。")
+
+            if paths == [expected]:
+                # A previous failed commit may leave *our* file staged.
+                # Retry safely only when its staged content matches disk;
+                # never overwrite intentionally partially staged content.
+                p = self.git_run(repo, ["diff", "--quiet", "--", self.path])
+                if p.returncode != 0:
+                    raise RuntimeError(
+                        "原稿のステージ内容とディスクの内容が一致しません。"
+                        "既存のステージを変更せず中止しました。git diff --cached と"
+                        " git diff で確認してください。")
+                out.append("前回の失敗でステージされた原稿を確認しました。安全に再試行します。")
 
             p = self.git_run(repo, ["add", "--", self.path])
             out.extend(self.cp_lines("git add（現在の原稿のみ）", p))
@@ -1620,22 +1655,29 @@ class Editor:
                 out.extend(self.cp_lines("git diff --cached", staged))
                 raise RuntimeError("コミット対象の確認に失敗しました。")
             paths = [p for p in staged.stdout.split("\0") if p]
-            expected = os.path.relpath(self.path, repo)
             if paths not in ([], [expected]):
                 raise RuntimeError(
-                    "コミット対象に別ファイルが含まれています。操作を中止しました。"
-                    "ターミナルで git status を確認してください。")
+                    "別ファイルがステージに混入しました。自動的に解除せず中止しました。"
+                    "git status を確認してください。")
+
+            # Check again after add to catch an intervening external rewrite.
+            if not self.manuscript_matches_disk():
+                raise RuntimeError(
+                    "送信処理中に原稿が外部で変更されました。"
+                    "ステージした内容は保持して中止しました。git status を確認してください。")
 
             if paths:
                 msg = "pome: update %s (%s)" % (
                     os.path.basename(self.path),
                     datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))
-                # --only は並行して別ファイルがステージされても巻き込まない。
                 p = self.git_run(
                     repo, ["commit", "--only", "-m", msg, "--", self.path])
                 out.extend(self.cp_lines("git commit（現在の原稿のみ）", p))
                 if p.returncode != 0:
-                    raise RuntimeError("git commitに失敗しました。pushは実行しません。")
+                    raise RuntimeError(
+                        "git commitに失敗しました。pushは実行しません。"
+                        "ステージされた原稿だけならpomeの送信を再実行できます。"
+                        "それ以外は git status を確認してください。")
             else:
                 out.append("現在の原稿にコミットすべき変更はありません。")
 
@@ -1643,7 +1685,8 @@ class Editor:
             out.extend(self.cp_lines("git push", p))
             if p.returncode != 0:
                 raise RuntimeError(
-                    "git pushに失敗しました。作成済みのローカルコミットは保持されています。")
+                    "git pushに失敗しました。ローカルコミットは保持されています。"
+                    "通信復旧後、送信を再実行できます。")
             ok = True
         except subprocess.TimeoutExpired:
             out.append("時間切れです。接続を確認してください。")
@@ -1667,13 +1710,8 @@ class Editor:
         ok = False
         try:
             # 別プロセスによる原稿変更を読み落としたまま受信しない。
-            if self.path and self._disk_data is not None:
-                try:
-                    with open(self.path, "rb") as f:
-                        current = f.read()
-                except FileNotFoundError:
-                    current = None
-                if current != self._disk_data:
+            if self.path:
+                if not self.manuscript_matches_disk():
                     raise RuntimeError(
                         "原稿が外部で変更または削除されています。再読込を確認してから受信してください。")
 
