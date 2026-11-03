@@ -1,0 +1,25 @@
+name: pome safety regression tests
+
+on:
+  push:
+    branches:
+      - pome-safety-hardening-20261103
+  pull_request:
+    branches:
+      - pome-writing-v1.1
+
+jobs:
+  offline-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Static compile and installer syntax
+        run: |
+          python -m compileall -q pome.py
+          sh -n install.sh
+      - name: Run existing and new regression tests
+        run: python -m unittest discover -s tests -v
