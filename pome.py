@@ -14,17 +14,23 @@ Debian bullseye の python3 標準ライブラリのみで動作する。
 
 import curses
 import datetime
+import hashlib
 import json
 import locale
 import os
+import stat
+import tempfile
 import subprocess
 import sys
 import time
 import unicodedata
 
-VERSION = "1.0.0"
-CONFIG_DIR = os.path.expanduser("~/.config/pome")
+VERSION = "1.1.0"
+CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or
+                          os.path.expanduser("~/.config"), "pome")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
+HISTORY_DIR = os.path.join(os.environ.get("XDG_STATE_HOME") or
+                           os.path.expanduser("~/.local/state"), "pome", "history")
 
 DEFAULT_CONFIG = {
     "ambiguous_wide": True,   # 曖昧幅文字(※や○など)を全角として扱う
@@ -74,6 +80,7 @@ MENUS = [
         ("開く...", "^O", "file_open"),
         ("上書き保存", "^S", "file_save"),
         ("名前を付けて保存...", "", "file_saveas"),
+        ("保存履歴から復元...", "", "file_history"),
         None,
         ("終了", "^Q", "quit"),
     ]),
@@ -143,6 +150,8 @@ HELP_LINES = [
     "--- その他 ---",
     "Ctrl+W       文字数カウント",
     "Git 連携はメニューの「ツール」から",
+    "保存済みの内容を戻す: ファイル → 保存履歴から復元",
+    "無題の原稿は最初に Ctrl+S で名前を付けると自動保存されます",
 ]
 
 
@@ -235,9 +244,12 @@ class Editor:
 
         self.lines = [""]
         self.path = None
+        self._saved_text = ""
+        self._disk_data = None
         self.encoding = "utf-8"
         self.crlf = False
         self.dirty = False
+        self._autosave_failed = False
         self.version = 0
 
         self.cy = 0
@@ -295,7 +307,8 @@ class Editor:
     # ------------------------------------------------------------ 入出力
 
     def load_file(self, path):
-        path = os.path.abspath(path)
+        path = os.path.realpath(path)
+        raw = None
         text = ""
         encoding = "utf-8"
         if os.path.exists(path):
@@ -312,9 +325,12 @@ class Editor:
         self.crlf = "\r\n" in text
         text = text.replace("\r\n", "\n").replace("\r", "\n")
         self.lines = text.split("\n")
+        self._saved_text = text
+        self._disk_data = raw
         self.path = path
         self.encoding = encoding
         self.dirty = False
+        self._autosave_failed = False
         self.version += 1
         self.cy = self.cx = 0
         self.want_x = None
@@ -332,30 +348,129 @@ class Editor:
             path = self.path
         if path is None:
             return self.act_file_saveas()
+        path = os.path.realpath(path)
         text = "\n".join(self.lines)
-        if self.crlf:
-            text = text.replace("\n", "\r\n")
+        encoded_text = text.replace("\n", "\r\n") if self.crlf else text
+        encoding = self.encoding
         try:
-            data = text.encode(self.encoding)
+            data = encoded_text.encode(encoding)
         except UnicodeEncodeError:
-            data = text.encode("utf-8")
-            self.encoding = "utf-8"
-            self.flash_msg("cp932にない文字があるためUTF-8で保存しました", 4)
+            data = encoded_text.encode("utf-8")
+            encoding = "utf-8"
+        tmp = None
         try:
-            tmp = path + ".pome~"
-            with open(tmp, "wb") as f:
-                f.write(data)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp, path)
+            try:
+                with open(path, "rb") as f:
+                    previous = f.read()
+                    mode = stat.S_IMODE(os.fstat(f.fileno()).st_mode)
+            except FileNotFoundError:
+                previous, mode = None, None
+            if path == self.path and previous != self._disk_data:
+                self.msgbox("保存を中止しました", [
+                    "原稿が別のプログラムで変更または削除されています。",
+                    "名前を付けて保存で、現在の内容を別ファイルに保存してください。"])
+                return False
+            if previous != data:
+                # Never replace a manuscript unless its old bytes are recoverable.
+                if previous is not None:
+                    self.keep_history(path, previous)
+                fd, tmp = tempfile.mkstemp(prefix=".pome-", dir=os.path.dirname(path))
+                with os.fdopen(fd, "wb") as f:
+                    if mode is not None:
+                        os.fchmod(f.fileno(), mode)
+                    f.write(data)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, path)
         except OSError as e:
-            self.msgbox("保存エラー", [str(e)])
+            self.msgbox("保存エラー", [str(e), "元の原稿は上書きしていません。"])
             return False
-        self.path = os.path.abspath(path)
+        finally:
+            if tmp is not None and os.path.exists(tmp):
+                os.unlink(tmp)
+        if encoding != self.encoding:
+            self.flash_msg("cp932にない文字があるためUTF-8で保存しました", 4)
+        self.encoding = encoding
+        self.path = path
+        self._saved_text = text
+        self._disk_data = data
         self.dirty = False
+        self._autosave_failed = False
         self.config["last_file"] = self.path
         self.save_config()
         return True
+
+    @staticmethod
+    def history_directory(path):
+        key = hashlib.sha256(os.fsencode(os.path.realpath(path))).hexdigest()
+        return os.path.join(HISTORY_DIR, key)
+
+    @classmethod
+    def keep_history(cls, path, data):
+        directory = cls.history_directory(path)
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f-")
+        fd, backup = tempfile.mkstemp(prefix=stamp, suffix=".txt", dir=directory)
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+        except OSError:
+            os.unlink(backup)
+            raise
+        return backup
+
+    def history_files(self):
+        if self.path is None:
+            return []
+        directory = self.history_directory(self.path)
+        try:
+            return [os.path.join(directory, name)
+                    for name in sorted(os.listdir(directory), reverse=True)
+                    if name.endswith(".txt")]
+        except FileNotFoundError:
+            return []
+
+    def act_file_history(self):
+        try:
+            files = self.history_files()
+            if not files:
+                self.msgbox("保存履歴", ["この原稿の保存履歴はまだありません。"])
+                return
+            self.msgbox("保存履歴（新しい順）", [
+                "%d. %s" % (i + 1, os.path.basename(path))
+                for i, path in enumerate(files)])
+            number = self.prompt("復元する番号（Escで中止）: ")
+            if number is None:
+                return
+            try:
+                index = int(number) - 1
+            except ValueError:
+                index = -1
+            if not 0 <= index < len(files):
+                self.flash_msg("一覧にある番号を入力してください")
+                return
+            with open(files[index], "rb") as f:
+                raw = f.read()
+            try:
+                text = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                text = raw.decode("cp932")
+            text = text.replace("\r\n", "\n").replace("\r", "\n")
+            self.msgbox("復元内容のプレビュー", text.split("\n"))
+            if self.choice("この内容を復元しますか？ (y)復元 (Esc)中止", ("y",)) != "y":
+                return
+            self.checkpoint("block")
+            self.lines = text.split("\n")
+            self.cy = self.cx = 0
+            self.top = (0, 0)
+            self.anchor = None
+            self.mark_changed()
+            self.last_kind = None
+            self.flash_msg("復元しました（Ctrl+Zで取り消し、Ctrl+Sで保存）", 4)
+        except (OSError, UnicodeError) as e:
+            self.msgbox("履歴の読み込みエラー", [str(e)])
 
     def emergency_save(self):
         """異常終了時の退避保存"""
@@ -509,10 +624,12 @@ class Editor:
         self.last_change_time = time.time()
 
     def snapshot(self):
-        return (self.lines[:], self.cy, self.cx, self.dirty)
+        return (self.lines[:], self.cy, self.cx)
 
     def restore(self, snap):
-        self.lines, self.cy, self.cx, self.dirty = snap[0][:], snap[1], snap[2], snap[3]
+        self.lines, self.cy, self.cx = snap[0][:], snap[1], snap[2]
+        self.dirty = "\n".join(self.lines) != self._saved_text
+        self.last_change_time = time.time()
         self.cy = min(self.cy, len(self.lines) - 1)
         self.cx = min(self.cx, len(self.lines[self.cy]))
         self.anchor = None
@@ -871,7 +988,7 @@ class Editor:
             self.draw()
             h, w = self.scr.getmaxyx()
             box_w = min(w - 4, max(20, max(
-                [text_dw(title, self.cw)] +
+                [text_dw(title, self.cw) + 2] +
                 [text_dw(l, self.cw) for l in lines]) + 4))
             box_h = min(h - 4, len(lines) + 4)
             view_h = box_h - 4
@@ -1194,9 +1311,12 @@ class Editor:
             return
         self.lines = [""]
         self.path = None
+        self._saved_text = ""
+        self._disk_data = None
         self.encoding = "utf-8"
         self.crlf = False
         self.dirty = False
+        self._autosave_failed = False
         self.version += 1
         self.cy = self.cx = 0
         self.top = (0, 0)
@@ -1522,8 +1642,8 @@ class Editor:
     def handle(self, k):
         if isinstance(k, str):
             if k == "\x1b":
-                if self.pending_key() is not None:
-                    return  # Alt+何か は無視
+                if not self.is_bare_esc():
+                    return  # Alt や未解釈の端末シーケンスは本文に入れない
                 if self.anchor is not None:
                     self.anchor = None
                 else:
@@ -1583,11 +1703,15 @@ class Editor:
 
     def tick(self):
         """入力タイムアウト時の処理（自動保存など）"""
-        if (self.config["autosave"] and self.dirty and self.path
+        if (self.config["autosave"] and not self._autosave_failed
+                and self.dirty and self.path
                 and time.time() - self.last_change_time
                 >= self.config["autosave_idle_sec"]):
             if self.save_file():
                 self.flash_msg("自動保存しました", 1.5)
+            else:
+                self._autosave_failed = True
+                self.flash_msg("自動保存を一時停止しました。Ctrl+Sまたは名前を付けて保存で再開", 6)
 
     # ------------------------------------------------------------ メインループ
 
